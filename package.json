@@ -1,0 +1,21 @@
+{
+  "name": "simple-review-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "review": "./src/cli.ts"
+  },
+  "scripts": {
+    "build": "bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig ./src/cli.ts --outfile dist/review",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
