@@ -16,7 +16,7 @@ Research reviewed September 21, 2026. These are code-quality checks, not authors
 
 | Rule ID | Required evidence | Important exception |
 | --- | --- | --- |
-| `duplicate-logic` | Two implementations coexist in the resulting hunk | Moves and replacements are not duplicates |
+| `duplicate-logic` | An added line plus a second, distinct implementation verified using only the new snapshot | Removed implementations, moves, and replacements are not duplicates |
 | `redundant-guard` | Executable code already rules out the branch | Types alone do not prove external data is valid |
 | `type-check-bypass` | A new type escape conceals a concrete mismatch | Validated narrowing and negative type tests |
 | `test-weakening` | A visible assertion or failure signal is removed without equivalent coverage | Requirement changes and documented quarantines |
@@ -29,6 +29,8 @@ Existing generic rules were narrowed to reduce overlapping findings. Existing ch
 ## Verification
 
 `just check` tests the command and its request/report behavior against simulated answers. It cannot establish semantic detection quality.
+
+Diff regression tests exercise separate old/new snapshots, absolute line numbers across multiple hunks, and duplicate claims supported only by removed code or a single resulting implementation. A second set checks that duplicate verification rejects missing peers, old-version peers, and self-references, while genuine two-location findings retain both locations. These checks enforce evidence structure even if the initial model judgment is wrong.
 
 `just eval` sends 14 authored examples (one problematic change and one legitimate counterpart per added rule) through the real review path at the default 0.85 threshold. It requires an exported `TYPESAFE_API_KEY` and uses API credits. Each case checks whether its target rule is reported; legitimate counterparts may still trigger unrelated rules. Output records the responding model and reported findings. This is a small regression set, not a representative accuracy benchmark.
 

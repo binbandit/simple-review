@@ -43,7 +43,7 @@ review | tracked changes against HEAD
 1 potential issue. Verify the evidence before changing code.
 ```
 
-Findings are sorted by severity, file, and line. Each includes a stable rule ID, changed-line location, source excerpt, explanation, and suggested fix. Removed lines are labeled as locations in the old version.
+Findings are sorted by severity, file, and line. Each includes a stable rule ID, changed-line location, source excerpt, explanation, and suggested fix. Removed lines are labeled as locations in the old version. Duplicate-code findings also show an `Other copy` location in the new version; a removed implementation cannot serve as the second copy.
 
 Exit codes:
 
@@ -65,7 +65,11 @@ See [research and rule boundaries](RESEARCH.md) for sources, required evidence, 
 
 “Slop” describes concrete code problems, not who wrote the code. The checks explicitly exclude speculative complaints and problems that already existed before the change.
 
-Jev returns typed judgments, not freeform explanations. For each hunk, one request asks all eighteen issue-presence questions and eighteen speculative line-selection questions together. A finding requires an issue probability at or above the threshold and a selected changed line. The explanation, suggested fix, and severity come from the selected rule in [src/rules.ts](src/rules.ts); they are general guidance, not a generated diagnosis of your exact program. Line-selection probability is preserved separately in JSON.
+Jev returns typed judgments, not freeform explanations. Each hunk is reconstructed into separate `before` and `after` snapshots, with old/new line IDs and explicit lists of added and removed lines. The old and new versions are never presented as one combined block of source code.
+
+One request asks all eighteen issue-presence questions and eighteen speculative line-selection questions together. A finding requires an issue probability at or above the threshold and a selected changed line. A potential duplicate must point to an added line, then pass a follow-up check using only the new snapshot. That check must identify a distinct, coexisting implementation. Confirmed duplicate findings include `duplicateOf: { file, line, text }` in JSON and show both locations in terminal output. Follow-up requests use the same model version and share the hunk's 60-second deadline.
+
+The explanation, suggested fix, and severity come from the selected rule in [src/rules.ts](src/rules.ts); they are general guidance, not a generated diagnosis of your exact program. Line-selection probability is preserved separately in JSON.
 
 ## Scope and limits
 
