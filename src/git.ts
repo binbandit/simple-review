@@ -11,6 +11,7 @@ export interface Hunk {
   oldFile: string;
   header: string;
   lines: DiffLine[];
+  focus?: { start: number; end: number };
 }
 
 export interface Skipped {

@@ -1,10 +1,10 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { SystemOneRequestPayload } from "@typesafe-ai/sdk";
 import { git, readDiff } from "@/git";
-import type { Report, ReviewState } from "@/review";
+import type { Report, ReviewState, SourceReviewState } from "@/review";
 import { rules } from "@/rules";
 import { slopCases } from "./slop-cases";
 
@@ -58,15 +58,18 @@ function service(rule?: string, side: "added" | "removed" = "added", probability
       expect(new URL(request.url).pathname).toBe("/v1/systemone");
       expect(request.headers.get("authorization")).toBe("Bearer test-key");
       if (body.questions.duplicated) {
-        const state = body.state as { peerIds: string[]; primaryId: string };
-        const peer = duplicateEvidence === "absent" ? "none" : duplicateEvidence === "same" ? state.primaryId : duplicateEvidence === "old" ? "old:1" : state.peerIds[0]!;
+        const state = body.state as { peerIds: string[]; primaryId: string; after: { id: string; text: string }[] };
+        const matchingPeer = state.after.find((line) => state.peerIds.includes(line.id) && /^function (label|ownerLabel)/.test(line.text))?.id;
+        const peer = duplicateEvidence === "absent" ? "none" : duplicateEvidence === "same" ? state.primaryId : duplicateEvidence === "old" ? "old:1" : matchingPeer ?? state.peerIds[0]!;
         return Response.json({ model: "jev-test", answers: {
           duplicated: { type: "noul", noul: duplicateEvidence === "absent" ? 0.01 : probability },
           peer: { type: "choice", choice: peer, confidence: 0.99, probabilities: { [peer]: 0.99 } },
         }, usage: { input_tokens: 100, output_tokens: 20 } });
       }
-      const state = body.state as ReviewState;
-      const selected = state.changed[side][0];
+      const state = body.state as ReviewState | SourceReviewState;
+      const selected = "focus" in state
+        ? (rule === "duplicate-logic" ? state.source.find((line) => state.focus.includes(line.id) && /^function label/.test(line.text))?.id : undefined) ?? state.focus[0]
+        : state.changed[side][0];
       const answers = Object.fromEntries(Object.entries(body.questions).map(([id, question]) => {
         if (question.type === "noul") return [id, { type: "noul", noul: id === rule ? probability : 0.01 }];
         const choice = id === `${rule}_line` && locate ? selected : "none";
@@ -84,9 +87,146 @@ test("help, version, invalid flags, and non-repositories work in the compiled CL
   expect((await run(temporary, ["--version"])).stdout.trim()).toBe("review 0.1.0");
   expect((await run(temporary, ["--threshold", "NaN"])).code).toBe(2);
   expect((await run(temporary, ["--staged", "--base", "main"])).code).toBe(2);
+  expect((await run(temporary, ["--all", "--staged"])).code).toBe(2);
+  expect((await run(temporary, ["--all", "--base", "main"])).code).toBe(2);
   const unknown = await run(temporary, ["--json", "--unknown"]);
   expect(JSON.parse(unknown.stdout).complete).toBe(false);
   expect((await run(temporary)).code).toBe(2);
+});
+
+async function sourceProject() {
+  const root = await mkdtemp(join(temporary, "source-"));
+  repos.push(root);
+  await mkdir(join(root, "src"));
+  return root;
+}
+
+test("--all scans a non-Git project's current src, using only applicable slop rules", async () => {
+  const root = await sourceProject();
+  await mkdir(join(root, "src", "nested"));
+  await writeFile(join(root, "outside.ts"), "not part of this scan");
+  await writeFile(join(root, "src", "nested", "app.ts"), "// Set the count to one\nconst count = 1;\n");
+  const api = service("comment-noise");
+  const result = await run(join(root, "src", "nested"), ["--all", "--json"], api.env);
+  expect(result.code).toBe(1);
+  const report: Report = JSON.parse(result.stdout);
+  expect(report).toMatchObject({ root: await realpath(root), files: 1, reviewedHunks: 0, reviewedSections: 1, complete: true });
+  expect(report.findings[0]).toMatchObject({ rule: "comment-noise", file: "src/nested/app.ts", line: 1 });
+  const state = api.requests[0]?.state as SourceReviewState;
+  expect(state).not.toHaveProperty("before");
+  expect(state).not.toHaveProperty("changed");
+  expect(state.source[0]).toMatchObject({ id: "source:1", text: "// Set the count to one" });
+  expect(Object.keys(api.requests[0]!.questions)).toHaveLength(16);
+  expect(api.requests[0]?.questions).not.toHaveProperty("injection");
+  expect(api.requests[0]?.questions).not.toHaveProperty("test-weakening");
+  const output = await run(root, ["--all"], api.env);
+  expect(output.stdout).toContain("1 section reviewed across 1 source file");
+  expect(output.stdout).toContain("  >     1   // Set the count to one");
+  expect(output.stdout).not.toContain("+ // Set");
+});
+
+test("--all includes unchanged tracked and untracked src files, respecting Git ignores", async () => {
+  const root = await repository();
+  await mkdir(join(root, "src"));
+  await writeFile(join(root, "src", "tracked.ts"), "export const tracked = 1;\n");
+  await git(["add", "src"], root);
+  await git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "Source"], root);
+  await writeFile(join(root, "src", "untracked.ts"), "export const untracked = 2;\n");
+  await writeFile(join(root, "src", "ignored.ts"), "ignored");
+  await writeFile(join(root, ".gitignore"), "src/ignored.ts\n");
+  const api = service();
+  const result = await run(root, ["--all", "--json"], api.env);
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout).files).toBe(2);
+  expect(api.requests.map((request) => (request.state as SourceReviewState).file)).toEqual(["src/tracked.ts", "src/untracked.ts"]);
+});
+
+test("--all splits large source files with context and covers each original line once", async () => {
+  const root = await sourceProject();
+  const lines = Array.from({ length: 270 }, (_, index) => `// Describe statement ${index + 1}`);
+  await writeFile(join(root, "src", "large.ts"), `${lines.join("\n")}\n`);
+  const api = service("comment-noise");
+  const result = await run(root, ["--all", "--json"], api.env);
+  const report: Report = JSON.parse(result.stdout);
+  expect(result.code).toBe(1);
+  expect(report).toMatchObject({ complete: true, reviewedSections: 3, skipped: [] });
+  expect(report.findings.map((finding) => finding.line)).toEqual([1, 121, 241]);
+  const states = api.requests.map((request) => request.state as SourceReviewState);
+  expect(states.flatMap((state) => state.focus)).toEqual(lines.map((_, index) => `source:${index + 1}`));
+  expect(states[1]?.source[0]?.line).toBe(113);
+  for (const state of states) {
+    for (const line of state.source) expect(line.text).toBe(lines[line.line - 1]!);
+    expect(Buffer.byteLength(JSON.stringify(state))).toBeLessThanOrEqual(20_000);
+  }
+});
+
+test("--all adapts section size for long lines and reports an individually oversized line", async () => {
+  const root = await sourceProject();
+  const lines = Array.from({ length: 30 }, () => `const text = "${"x".repeat(1000)}";`);
+  lines.push("x".repeat(21_000), "export const tail = true;");
+  await writeFile(join(root, "src", "wide.ts"), lines.join("\n"));
+  const api = service();
+  const result = await run(root, ["--all", "--json"], api.env);
+  expect(result.code).toBe(2);
+  expect(JSON.parse(result.stdout).skipped).toEqual([{ file: "src/wide.ts", reason: "Line 31 exceeds the source review size limit." }]);
+  const focus = api.requests.flatMap((request) => (request.state as SourceReviewState).focus);
+  expect(focus).toEqual(lines.flatMap((_, index) => index === 30 ? [] : [`source:${index + 1}`]));
+});
+
+test("--all handles missing/empty src and skips binaries and symlinks", async () => {
+  const missing = await run(temporary, ["--all", "--json"]);
+  expect(missing.code).toBe(2);
+  expect(JSON.parse(missing.stdout).error).toContain("No src directory");
+  const root = await sourceProject();
+  expect((await run(root, ["--all", "--json"])).code).toBe(0);
+  await writeFile(join(root, "outside.ts"), "must not be read");
+  await writeFile(join(root, "src", "binary.bin"), new Uint8Array([0, 1, 2]));
+  await symlink(join(root, "outside.ts"), join(root, "src", "link.ts"));
+  await mkdir(join(root, "src", "node_modules"));
+  await writeFile(join(root, "src", "node_modules", "dependency.ts"), "must not be read");
+  const result = await run(root, ["--all", "--json"]);
+  expect(result.code).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({ files: 2, reviewedSections: 0, complete: false });
+  expect(JSON.parse(result.stdout).skipped).toHaveLength(2);
+});
+
+test("--all does not silently ignore Git errors and broaden the source scan", async () => {
+  const root = await sourceProject();
+  await mkdir(join(root, ".git"));
+  await writeFile(join(root, "src", "app.ts"), "export const value = 1;");
+  const api = service();
+  const result = await run(root, ["--all", "--json"], api.env);
+  expect(result.code).toBe(2);
+  expect(JSON.parse(result.stdout).complete).toBe(false);
+  expect(api.requests).toHaveLength(0);
+});
+
+test("--all keeps duplicate verification for existing code and displays both current locations", async () => {
+  const root = await sourceProject();
+  const fixture = slopCases.find((fixture) => fixture.rule === "duplicate-logic")!;
+  await writeFile(join(root, "src", "format.ts"), fixture.problematic);
+  const api = service("duplicate-logic");
+  const result = await run(root, ["--all", "--json"], api.env);
+  const report: Report = JSON.parse(result.stdout);
+  expect(result.code).toBe(1);
+  expect(report.findings[0]).toMatchObject({ line: 1, duplicateOf: { file: "src/format.ts", line: 2 } });
+  expect(api.requests).toHaveLength(2);
+});
+
+test("--all reports a duplicate pair only once when section contexts overlap", async () => {
+  const root = await sourceProject();
+  const lines = Array.from({ length: 124 }, (_, index) => `export const item${index} = ${index};`);
+  lines[119] = 'function labelA(user) { return user.first.trim() + " " + user.last.trim(); }';
+  lines[120] = 'function labelB(user) { return user.first.trim() + " " + user.last.trim(); }';
+  await writeFile(join(root, "src", "labels.ts"), lines.join("\n"));
+  const api = service("duplicate-logic");
+  const result = await run(root, ["--all", "--json"], api.env);
+  const report: Report = JSON.parse(result.stdout);
+  expect(result.code).toBe(1);
+  expect(report.reviewedSections).toBe(2);
+  expect(api.requests).toHaveLength(4);
+  expect(report.findings).toHaveLength(1);
+  expect(report.findings[0]).toMatchObject({ line: 120, duplicateOf: { line: 121 } });
 });
 
 test("clean diff needs no API key and ignores untracked files", async () => {

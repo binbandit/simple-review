@@ -1,6 +1,6 @@
 # review
 
-A small Bun CLI that asks [TypeSafe's Jev](https://docs.typesafe.ai/) to flag potential security regressions, bugs, and AI slop in your Git diff.
+A small Bun CLI that asks [TypeSafe's Jev](https://docs.typesafe.ai/) to flag potential security regressions, bugs, and AI slop in your Git diff, or scan your current `src` folder for slop with `--all`.
 
 ## Install
 
@@ -22,11 +22,25 @@ Get an API key from the [TypeSafe console](https://console.typesafe.ai). The com
 review                        # staged + unstaged tracked changes against HEAD
 review --staged                # index only
 review --base main             # merge base with main through the current working tree
+review --all                   # inspect existing code in src for AI slop
+review --all --json            # source scan with structured output
 review --json                  # structured output for agents and scripts
 review --threshold 0.9         # report only higher-probability issues (default: 0.85)
 ```
 
-Run from anywhere inside a Git working tree. New files must be staged with `git add` to appear in the diff. `--staged` and `--base` are mutually exclusive. Repositories without an initial commit are supported. Resolve merge conflicts before reviewing.
+Run diff reviews from anywhere inside a Git working tree. New files must be staged with `git add` to appear in the diff. `--all`, `--staged`, and `--base` are mutually exclusive. Repositories without an initial commit are supported. Resolve merge conflicts before reviewing a diff.
+
+### Scan all source
+
+`review --all` recursively checks current text files in the nearest ancestor's `src` directory, starting at your current directory and stopping at the Git root if present. This supports project roots and subdirectories, including nested packages with their own `src`. It works without Git and without pending changes.
+
+In Git projects, it includes tracked and untracked files while respecting Git ignore rules for untracked files. Without Git, it includes all regular UTF-8 text files under `src`. It excludes `node_modules` and `.git` directories, does not follow symlinks, and reports binary/non-UTF-8 files as skipped. A missing `src` is an error; an empty `src` completes without an API call.
+
+This mode applies eight checks to existing code: placeholders, unnecessary abstractions, noisy comments, duplication, redundant guards, type-check bypasses, self-fulfilling tests, and hardcoded test answers. It does not apply security/regression checks or infer that an existing test was weakened without a baseline. Use diff mode for those checks.
+
+Source files are split into sections of up to 120 focus lines, with up to eight context lines on either side. Sections shrink as needed to fit the request budget. Context supports judgments but cannot itself generate a finding in that section, so each source line is reviewed as a focus line once. Locations retain original line numbers. Confirmed duplicate pairs spanning overlapping sections are reported once. An individual line too large to review is explicitly skipped, making the scan incomplete. Distant and cross-file relationships can be missed.
+
+In `--all --json` reports, `reviewedSections` counts source sections and `reviewedHunks` is zero. Excerpt lines use `kind: "context"`, with current line numbers in `newLine` and `side: "new"`; they are not represented as additions. Source files and context are sent to the configured TypeSafe endpoint.
 
 Example output (illustrative):
 
@@ -73,7 +87,7 @@ The explanation, suggested fix, and severity come from the selected rule in [src
 
 ## Scope and limits
 
-The CLI sends each text diff hunk, its file paths, and eight surrounding context lines to the configured TypeSafe API. It does not send the full repository. Hunks are evaluated independently, so cross-file and distant context may be missed. It reports at most one finding per rule per hunk and can miss other types of problems. Findings can be wrong, and no findings is not proof that a change is safe.
+In diff mode, the CLI sends each text hunk, its file paths, and eight surrounding context lines to the configured TypeSafe API. In source mode, it sends the current source sections described above. Hunks and source sections are evaluated independently, so cross-file and distant context may be missed. It reports at most one finding per rule per hunk or section and can miss other types of problems. Findings can be wrong, and no findings is not proof that code is safe.
 
 The initial 0.85 threshold is a conservative reporting default, not an empirically calibrated guarantee. Model probabilities describe Jev's judgments, not measured detection accuracy. Evaluate it on your own changes before using exit codes to gate merges.
 

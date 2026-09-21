@@ -2,15 +2,17 @@
 import { parseArgs } from "node:util";
 import { APIConnectionError, APIError, APIUserAbortError, TypeSafeClient } from "@typesafe-ai/sdk";
 import { readDiff } from "@/git";
-import { formatReport, reviewHunk, safeText, type Report } from "@/review";
+import { readSource } from "@/source";
+import { deduplicateFindings, formatReport, reviewHunk, safeText, type Report } from "@/review";
 
-const help = `review - spot potential bugs, security regressions, and AI slop in a Git diff
+const help = `review - review Git diffs or scan src for AI slop
 
-Usage: review [--staged | --base <ref>] [--json] [--threshold <0..1>]
+Usage: review [--all | --staged | --base <ref>] [--json] [--threshold <0..1>]
 
   review              Review tracked working-tree changes against HEAD (staged + unstaged)
   review --staged     Review only staged changes
   review --base main  Review changes since the merge base with main, including local edits
+  review --all        Check current files in src for AI slop, even without Git changes
   review --json       Emit one JSON report for an agent or script
   --threshold <n>     Minimum issue probability to report (default: 0.85)
   -h, --help          Show this help
@@ -18,7 +20,9 @@ Usage: review [--staged | --base <ref>] [--json] [--threshold <0..1>]
 
 Set TYPESAFE_API_KEY to use Jev. TYPESAFE_DEFAULT_MODEL defaults to jev-latest.
 Diff hunks and eight lines of surrounding context are sent to TypeSafe.
-Untracked files are excluded; stage them with git add to include them.
+--all sends current source sections with up to eight lines of surrounding context.
+Diff mode excludes untracked files; stage them with git add to include them.
+--all includes untracked source files and works without Git. Git ignore rules apply when available.
 Exit codes: 0 = no findings, 1 = findings, 2 = error or incomplete review.
 `;
 
@@ -27,6 +31,7 @@ try {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
     options: {
+      all: { type: "boolean", default: false },
       staged: { type: "boolean", default: false },
       base: { type: "string" },
       json: { type: "boolean", default: false },
@@ -43,39 +48,42 @@ try {
   } else if (values.version) {
     console.log("review 0.1.0");
   } else {
-    if (values.staged && values.base !== undefined) throw new Error("Use either --staged or --base, not both.");
+    if (Number(values.all) + Number(values.staged) + Number(values.base !== undefined) > 1) throw new Error("Use only one of --all, --staged, or --base.");
     if (values.base !== undefined && !values.base.trim()) throw new Error("--base requires a nonempty Git reference.");
     const threshold = Number(values.threshold);
     if (!values.threshold.trim() || !Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
       throw new Error("--threshold must be a number between 0 and 1.");
     }
-    const diff = await readDiff(values);
+    const diff = values.all ? await readSource() : await readDiff(values);
     const report: Report = {
       version: 1,
-      scope: values.staged ? "staged changes" : values.base ? `changes since merge base with ${values.base}` : "tracked changes against HEAD",
+      scope: values.all ? "AI slop in src (current files)" : values.staged ? "staged changes" : values.base ? `changes since merge base with ${values.base}` : "tracked changes against HEAD",
       root: diff.root,
       models: [],
       threshold,
       files: diff.files,
       reviewedHunks: 0,
+      ...(values.all ? { reviewedSections: 0 } : {}),
       findings: [],
       skipped: diff.skipped,
       complete: false,
     };
     if (diff.hunks.length) {
-      if (!Bun.env.TYPESAFE_API_KEY?.trim()) throw new Error("Set TYPESAFE_API_KEY before reviewing changes. Get a key at https://console.typesafe.ai.");
+      if (!Bun.env.TYPESAFE_API_KEY?.trim()) throw new Error("Set TYPESAFE_API_KEY before reviewing code. Get a key at https://console.typesafe.ai.");
       const client = new TypeSafeClient({ timeout: 20_000, logLevel: "off" });
       for (const [index, hunk] of diff.hunks.entries()) {
         if (!json && process.stderr.isTTY) console.error(safeText(`Reviewing ${index + 1}/${diff.hunks.length}: ${hunk.file}`));
-        const result = await reviewHunk(client, hunk, threshold);
+        const result = await reviewHunk(client, hunk, threshold, values.all ? "source" : "diff");
         report.findings.push(...result.findings);
         if (result.skipped) report.skipped.push(result.skipped);
+        else if (report.reviewedSections !== undefined) report.reviewedSections++;
         else report.reviewedHunks++;
         if (result.model && !report.models.includes(result.model)) report.models.push(result.model);
       }
     }
     const severity = { high: 0, medium: 1, low: 2 };
     report.findings.sort((a, b) => severity[a.severity] - severity[b.severity] || a.file.localeCompare(b.file) || a.line - b.line || a.rule.localeCompare(b.rule));
+    report.findings = deduplicateFindings(report.findings);
     report.complete = report.skipped.length === 0;
     console.log(json ? JSON.stringify(report, null, 2) : formatReport(report));
     process.exitCode = !report.complete ? 2 : report.findings.length ? 1 : 0;
